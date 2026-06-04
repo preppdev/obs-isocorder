@@ -12,6 +12,21 @@ This is a clean-room re-implementation inspired by the fundamentals of
 [exeldro/obs-source-record](https://github.com/exeldro/obs-source-record),
 focused on a smaller, well-structured core with fully synchronous teardown.
 
+## Install (macOS)
+
+Grab the latest **signed & Apple-notarized** package from the
+[**Releases**](https://github.com/preppdev/obs-isocorder/releases) page:
+
+- **`isolated-record-<version>-macos-arm64.pkg`** — double-click to install
+  (installs per-user, no admin password needed), then restart OBS. The dock
+  appears under **View → Docks → Isolated Record**.
+- Or **`…-macos-arm64.zip`** — unzip and drop `isolated-record.plugin` into
+  `~/Library/Application Support/obs-studio/plugins/`.
+
+Requires OBS Studio 30+ on Apple Silicon. The packages are signed with a
+Developer ID and notarized by Apple, so they install without Gatekeeper
+warnings. (Intel/universal and Windows/Linux builds are planned.)
+
 ## How it works
 
 The filter is **transparent** in the source's normal render chain (it does not
