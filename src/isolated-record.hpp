@@ -1,0 +1,73 @@
+/*
+ * Isolated Record - OBS Studio plugin
+ *
+ * A source filter that records the source it is attached to into its OWN
+ * dedicated file, independently of OBS's main recording/streaming. Each
+ * source gets its own private render pipeline (obs_view), video encoder,
+ * audio encoder, and ffmpeg output.
+ *
+ * This header declares the per-filter recorder. The implementation lives in
+ * isolated-record.cpp. The design follows the proven approach used by
+ * exeldro/obs-source-record: the filter itself is transparent in the video
+ * chain (it does not alter the source it is attached to); the actual capture
+ * happens through a separate obs_view that renders the parent source into a
+ * private video_t pipeline feeding the encoder.
+ */
+#pragma once
+
+#include <obs-module.h>
+#include <util/threading.h>
+#include <atomic>
+
+/* obs_view channel used to feed the parent source into the private pipeline. */
+#define IR_SOURCE_CHANNEL 0
+
+/* How recording starts/stops. */
+enum ir_record_mode {
+	IR_MODE_WHEN_ACTIVE = 0, /* record whenever the source is enabled/visible */
+	IR_MODE_MANUAL = 1,      /* start/stop via the property buttons or hotkey */
+};
+
+struct isolated_record {
+	obs_source_t *source; /* the filter source itself */
+
+	/* Private render + encode pipeline for the attached source. */
+	obs_view_t *view;
+	video_t *video_output;
+	audio_t *audio_output; /* privately opened, mixes the parent's audio */
+
+	obs_encoder_t *video_encoder;
+	obs_encoder_t *audio_encoder;
+	obs_output_t *file_output;
+
+	/* Dimensions the private pipeline is currently configured for. */
+	uint32_t width;
+	uint32_t height;
+
+	/* State. Touched from the graphics thread (tick) and frontend/UI thread;
+	 * use a mutex for the few cross-thread fields. */
+	pthread_mutex_t mutex;
+	enum ir_record_mode mode;
+	std::atomic<bool> output_active;
+	std::atomic<bool> want_record;   /* manual-mode request flag */
+	std::atomic<bool> starting;      /* an async start task is in flight */
+	bool closing;                    /* filter is being removed/destroyed */
+	bool needs_restart;              /* pipeline must be rebuilt (size change) */
+	bool showing;                    /* we hold an inc_showing on the parent */
+	bool prev_active;                /* last-seen source-active state (edge detect) */
+
+	/* Live status for the dock UI. */
+	uint64_t start_time_ns;          /* when the current recording started */
+	char current_file[512];          /* path of the file being written */
+	std::atomic<uint64_t> bytes;     /* bytes written so far (updated in tick) */
+
+	/* Session subfolder for a "Record All" group (empty = none). Guarded by
+	 * mutex; set by the dock's Record All, consumed when the output starts. */
+	char session_subfolder[128];
+
+	/* Hotkey to toggle manual recording. */
+	obs_hotkey_id record_hotkey;
+};
+
+/* Registered with OBS in plugin-main.cpp. */
+extern struct obs_source_info isolated_record_filter_info;
