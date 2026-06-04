@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 preppdev — Isolated Record (obs-isocorder)
+
 #include "dock.hpp"
 #include "recorder-api.hpp"
 #include "audio-recorder.hpp"

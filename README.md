@@ -114,3 +114,16 @@ src/dock.hpp / dock.cpp   the Qt "mission control" dock
 data/locale/en-US.ini     UI strings
 cmake/                     OBS plugin helpers + macOS bundle config
 ```
+
+## License
+
+Licensed under the **GNU General Public License v2.0 or later** (GPL-2.0-or-later)
+— see [LICENSE](LICENSE). This matches OBS Studio / libobs, which this plugin
+links against. You are free to use, modify, and redistribute it; derivative
+works distributed to others must also be made available under the GPL.
+
+## Credits
+
+Clean-room re-implementation inspired by the fundamentals of
+[exeldro/obs-source-record](https://github.com/exeldro/obs-source-record)
+(also GPL-2.0). Built on the OBS Studio plugin APIs.
