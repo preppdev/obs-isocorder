@@ -170,8 +170,15 @@ static void ensure_directory(char *path)
  * intended targets are regular inputs (cameras, mics), which do fire them.
  */
 
-/* Capture callback: append the source's audio into our per-channel deques.
- * Runs on the captured source's audio thread. */
+/* frames -> nanoseconds at a sample rate (rate falls back to 48k if unset). */
+static inline uint64_t ir_frames_to_ns(uint64_t frames, uint32_t rate)
+{
+	return frames * 1000000000ULL / (rate ? rate : 48000);
+}
+
+/* Capture callback: append the source's audio into our per-channel deques and
+ * remember the timestamp of the END of the newest sample. Runs on the captured
+ * source's audio thread. */
 static void ir_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
 	UNUSED_PARAMETER(source);
@@ -181,12 +188,9 @@ static void ir_audio_capture(void *param, obs_source_t *source, const struct aud
 		return;
 
 	pthread_mutex_lock(&ir->audio_buf_mutex);
-	/* Anchor the output timeline to the source clock when (re)starting from
-	 * an empty buffer. */
-	if (ir->audio_channels && ir->audio_buf[0].size == 0)
-		ir->audio_buf_ts = audio_data->timestamp;
-
-	/* Bound the backlog (~0.5s) so a stalled consumer can't grow it forever. */
+	/* Bound the backlog (~0.5s) so a stalled consumer can't grow it forever.
+	 * Dropping the oldest is fine: the drain derives its timestamp from the
+	 * newest sample and the current occupancy, so sync stays correct. */
 	const size_t cap = (size_t)(ir->audio_sample_rate / 2) * sizeof(float);
 	for (size_t ch = 0; ch < ir->audio_channels; ch++) {
 		if (cap && ir->audio_buf[ch].size > cap)
@@ -196,11 +200,20 @@ static void ir_audio_capture(void *param, obs_source_t *source, const struct aud
 		else
 			deque_push_back(&ir->audio_buf[ch], audio_data->data[ch], add);
 	}
+	/* Tail = system time the audio arrived. NOTE: audio_data->timestamp here
+	 * is the source's RAW device/media clock (OBS passes the un-adjusted value
+	 * to capture callbacks), which can differ from OBS's system clock by
+	 * seconds — and the video frames are on the system clock. Using
+	 * os_gettime_ns() keeps audio and video on the same timeline (the prior
+	 * raw-timestamp version drifted A/V by 1-5s). */
+	ir->audio_buf_ts = os_gettime_ns();
 	pthread_mutex_unlock(&ir->audio_buf_mutex);
 }
 
 /* The private audio_output pulls from here. Drains one frame-block from the
- * deques into every requested mix; emits silence on underrun. */
+ * deques into every requested mix; emits silence on underrun. The block's
+ * timestamp is derived as tail_ts - (buffered frames), which self-corrects for
+ * any dropped/short reads (no free-running accumulation -> no A/V drift). */
 static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint64_t *out_ts,
 				 uint32_t mixers, struct audio_output_data *mixes)
 {
@@ -211,6 +224,8 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 	pthread_mutex_lock(&ir->audio_buf_mutex);
 	const bool have = ir->audio_channels && ir->audio_buf[0].size >= need;
 	if (have) {
+		const uint64_t buffered_frames = ir->audio_buf[0].size / sizeof(float);
+		*out_ts = ir->audio_buf_ts - ir_frames_to_ns(buffered_frames, ir->audio_sample_rate);
 		for (size_t ch = 0; ch < ir->audio_channels; ch++) {
 			float tmp[AUDIO_OUTPUT_FRAMES];
 			deque_pop_front(&ir->audio_buf[ch], tmp, need);
@@ -221,9 +236,6 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 					memcpy(mixes[m].data[ch], tmp, need);
 			}
 		}
-		*out_ts = ir->audio_buf_ts;
-		ir->audio_buf_ts += (uint64_t)AUDIO_OUTPUT_FRAMES * 1000000000ULL /
-				    (ir->audio_sample_rate ? ir->audio_sample_rate : 48000);
 	}
 	pthread_mutex_unlock(&ir->audio_buf_mutex);
 

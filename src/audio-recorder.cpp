@@ -119,8 +119,14 @@ void capture_cb(void *param, size_t mix_idx, struct audio_data *data)
  * isolated source recorded pure silence. (Composite sources don't fire capture
  * callbacks; the intended targets are regular inputs like mics.) */
 
-/* Capture callback: append the source's audio into our deques. Source's audio
- * thread. */
+/* frames -> nanoseconds at a sample rate (rate falls back to 48k if unset). */
+inline uint64_t ar_frames_to_ns(uint64_t frames, uint32_t rate)
+{
+	return frames * 1000000000ULL / (rate ? rate : 48000);
+}
+
+/* Capture callback: append the source's audio into our deques and remember the
+ * timestamp of the END of the newest sample. Source's audio thread. */
 void ar_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
 	UNUSED_PARAMETER(source);
@@ -130,8 +136,6 @@ void ar_audio_capture(void *param, obs_source_t *source, const struct audio_data
 		return;
 
 	pthread_mutex_lock(&ar->audio_buf_mutex);
-	if (ar->buf_channels && ar->audio_buf[0].size == 0)
-		ar->buf_ts = audio_data->timestamp;
 	const size_t cap = (size_t)(ar->buf_sample_rate / 2) * sizeof(float); /* ~0.5s */
 	for (size_t ch = 0; ch < ar->buf_channels; ch++) {
 		if (cap && ar->audio_buf[ch].size > cap)
@@ -141,11 +145,17 @@ void ar_audio_capture(void *param, obs_source_t *source, const struct audio_data
 		else
 			deque_push_back(&ar->audio_buf[ch], audio_data->data[ch], add);
 	}
+	/* Tail = system time the audio arrived. audio_data->timestamp is the
+	 * source's RAW device clock (OBS passes the un-adjusted value to capture
+	 * callbacks) and can be seconds off OBS's system clock; os_gettime_ns()
+	 * keeps this WAV's timeline consistent (matters when grouped with video). */
+	ar->buf_ts = os_gettime_ns();
 	pthread_mutex_unlock(&ar->audio_buf_mutex);
 }
 
 /* priv_audio pulls from here: drain one frame-block from the deques; silence on
- * underrun (OBS pre-clears the mix buffers). */
+ * underrun (OBS pre-clears the mix buffers). The block timestamp is derived as
+ * tail_ts - (buffered frames), self-correcting for dropped reads (no drift). */
 bool source_mix_cb(void *param, uint64_t start_ts, uint64_t end_ts, uint64_t *out_ts, uint32_t mixers,
 		   struct audio_output_data *mixes)
 {
@@ -156,6 +166,8 @@ bool source_mix_cb(void *param, uint64_t start_ts, uint64_t end_ts, uint64_t *ou
 	pthread_mutex_lock(&ar->audio_buf_mutex);
 	const bool have = ar->buf_channels && ar->audio_buf[0].size >= need;
 	if (have) {
+		const uint64_t buffered_frames = ar->audio_buf[0].size / sizeof(float);
+		*out_ts = ar->buf_ts - ar_frames_to_ns(buffered_frames, ar->buf_sample_rate);
 		for (size_t ch = 0; ch < ar->buf_channels; ch++) {
 			float tmp[AUDIO_OUTPUT_FRAMES];
 			deque_pop_front(&ar->audio_buf[ch], tmp, need);
@@ -166,9 +178,6 @@ bool source_mix_cb(void *param, uint64_t start_ts, uint64_t end_ts, uint64_t *ou
 					memcpy(mixes[m].data[ch], tmp, need);
 			}
 		}
-		*out_ts = ar->buf_ts;
-		ar->buf_ts += (uint64_t)AUDIO_OUTPUT_FRAMES * 1000000000ULL /
-			      (ar->buf_sample_rate ? ar->buf_sample_rate : 48000);
 	}
 	pthread_mutex_unlock(&ar->audio_buf_mutex);
 
