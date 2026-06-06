@@ -102,8 +102,8 @@ echo "==> codesign .plugin ($CODESIGN_IDENT)"
 # A real Developer ID identity needs hardened runtime (--options runtime) and a
 # secure timestamp for notarization; ad-hoc ("-") ignores those.
 TS_FLAG=(); [[ "$CODESIGN_IDENT" != "-" ]] && TS_FLAG=(--timestamp)
-codesign --force --deep --options runtime "${TS_FLAG[@]}" --sign "$CODESIGN_IDENT" "$BUNDLE/Contents/MacOS/$NAME"
-codesign --force --deep --options runtime "${TS_FLAG[@]}" --sign "$CODESIGN_IDENT" "$BUNDLE"
+codesign --force --deep --options runtime ${TS_FLAG[@]+"${TS_FLAG[@]}"} --sign "$CODESIGN_IDENT" "$BUNDLE/Contents/MacOS/$NAME"
+codesign --force --deep --options runtime ${TS_FLAG[@]+"${TS_FLAG[@]}"} --sign "$CODESIGN_IDENT" "$BUNDLE"
 
 echo "==> zip"
 ditto -c -k --keepParent "$BUNDLE" "$DIST/$NAME-$VERSION-macos-$ARCH.zip"
