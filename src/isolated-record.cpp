@@ -181,7 +181,6 @@ static inline uint64_t ir_frames_to_ns(uint64_t frames, uint32_t rate)
  * source's audio thread. */
 static void ir_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
-	UNUSED_PARAMETER(source);
 	struct isolated_record *ir = (struct isolated_record *)param;
 	const size_t add = audio_data->frames * sizeof(float);
 	if (!add)
@@ -205,8 +204,10 @@ static void ir_audio_capture(void *param, obs_source_t *source, const struct aud
 	 * to capture callbacks), which can differ from OBS's system clock by
 	 * seconds — and the video frames are on the system clock. Using
 	 * os_gettime_ns() keeps audio and video on the same timeline (the prior
-	 * raw-timestamp version drifted A/V by 1-5s). */
-	ir->audio_buf_ts = os_gettime_ns();
+	 * raw-timestamp version drifted A/V by 1-5s). Add the source's OBS Sync
+	 * Offset (Advanced Audio Properties) so iso files match the live mix; the
+	 * capture callback bypasses where OBS would otherwise apply it. */
+	ir->audio_buf_ts = os_gettime_ns() + obs_source_get_sync_offset(source);
 	pthread_mutex_unlock(&ir->audio_buf_mutex);
 }
 

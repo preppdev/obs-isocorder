@@ -129,7 +129,6 @@ inline uint64_t ar_frames_to_ns(uint64_t frames, uint32_t rate)
  * timestamp of the END of the newest sample. Source's audio thread. */
 void ar_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
-	UNUSED_PARAMETER(source);
 	struct audio_recorder *ar = (struct audio_recorder *)param;
 	const size_t add = audio_data->frames * sizeof(float);
 	if (!add)
@@ -148,8 +147,9 @@ void ar_audio_capture(void *param, obs_source_t *source, const struct audio_data
 	/* Tail = system time the audio arrived. audio_data->timestamp is the
 	 * source's RAW device clock (OBS passes the un-adjusted value to capture
 	 * callbacks) and can be seconds off OBS's system clock; os_gettime_ns()
-	 * keeps this WAV's timeline consistent (matters when grouped with video). */
-	ar->buf_ts = os_gettime_ns();
+	 * keeps this WAV's timeline consistent (matters when grouped with video).
+	 * Add the source's OBS Sync Offset so it matches the live mix. */
+	ar->buf_ts = os_gettime_ns() + obs_source_get_sync_offset(source);
 	pthread_mutex_unlock(&ar->audio_buf_mutex);
 }
 
