@@ -15,7 +15,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 
 NAME=isolated-record
-VERSION=0.1.0
+VERSION=0.1.1
 ARCH="${ARCH:-arm64}"
 
 OBS_APP="${OBS_APP:-/Applications/OBS.app}"
@@ -40,7 +40,7 @@ cat > "$HERE/src/version.h" <<EOF
 #define PROJECT_VERSION "$VERSION"
 #define PROJECT_VERSION_MAJOR 0
 #define PROJECT_VERSION_MINOR 1
-#define PROJECT_VERSION_PATCH 0
+#define PROJECT_VERSION_PATCH 1
 EOF
 
 cflags=(
