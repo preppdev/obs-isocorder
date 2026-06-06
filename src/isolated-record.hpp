@@ -20,6 +20,8 @@
 
 #include <obs-module.h>
 #include <util/threading.h>
+#include <util/deque.h>
+#include <media-io/audio-io.h>
 #include <atomic>
 
 /* obs_view channel used to feed the parent source into the private pipeline. */
@@ -66,6 +68,21 @@ struct isolated_record {
 	enum ir_audio_mode audio_mode;
 	obs_weak_source_t *audio_weak;
 	char audio_source_name[256];
+
+	/* Push-based audio capture. While recording, a capture callback is
+	 * registered on the resolved audio target; it appends that source's own
+	 * audio into per-channel deques, which the private audio_output's
+	 * input_callback drains. This replaces reading obs_source_get_audio_mix(),
+	 * which only yields audio for sources actively rendered in the main mix —
+	 * so isolated/off-program sources captured pure silence. Guarded by
+	 * audio_buf_mutex (touched by the captured source's audio thread and the
+	 * audio_output thread). */
+	pthread_mutex_t audio_buf_mutex;
+	struct deque audio_buf[MAX_AUDIO_CHANNELS];
+	size_t audio_channels;         /* channels buffered = OBS output channels */
+	uint32_t audio_sample_rate;    /* OBS sample rate */
+	uint64_t audio_buf_ts;         /* ns timestamp of the oldest buffered sample */
+	obs_source_t *audio_cb_source; /* source the capture cb is on (strong ref) */
 	std::atomic<bool> output_active;
 	std::atomic<bool> want_record;   /* manual-mode request flag */
 	std::atomic<bool> starting;      /* an async start task is in flight */
