@@ -6,7 +6,7 @@ else()
   cmake_minimum_required(VERSION 3.18)
 endif()
 
-project(isolated-record VERSION 0.1.2)
+project(isolated-record VERSION 0.1.3)
 set(PROJECT_FULL_NAME "Isolated Record")
 
 # New UUIDs for this plugin (regenerate if you fork).
