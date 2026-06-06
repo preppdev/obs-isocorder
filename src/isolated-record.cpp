@@ -28,6 +28,24 @@
 /* Small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Sentinel "audio_source" value selecting a video-only file (no audio track).
+ * The empty string selects the source's own audio; anything else is a source
+ * name. Kept out of the source namespace by the double underscores. */
+#define IR_AUDIO_NONE_TOKEN "__none__"
+
+/* obs_enum_sources callback: add every audio-capable input to the property
+ * list (param is the obs_property_t* combo being populated). */
+static bool add_audio_source_to_list(void *param, obs_source_t *source)
+{
+	obs_property_t *list = (obs_property_t *)param;
+	if (obs_source_get_output_flags(source) & OBS_SOURCE_AUDIO) {
+		const char *name = obs_source_get_name(source);
+		if (name && *name)
+			obs_property_list_add_string(list, name, name);
+	}
+	return true;
+}
+
 /* File extension for a recording-format value (mirrors OBS's RecFormat2). */
 static const char *format_to_ext(const char *format)
 {
@@ -177,6 +195,22 @@ static void mix_audio(obs_source_t *parent, obs_source_t *child, void *param)
 	}
 }
 
+/* Pick the source whose audio should be embedded, returning a STRONG ref the
+ * caller must release (NULL = emit silence). Normally the parent (own audio);
+ * when overridden to a specific source, that source; IR_AUDIO_NONE never opens
+ * this audio path, but a mode flipped to NONE mid-recording lands here too. */
+static obs_source_t *resolve_audio_target(struct isolated_record *ir)
+{
+	obs_source_t *target = NULL;
+	pthread_mutex_lock(&ir->mutex);
+	if (ir->audio_mode == IR_AUDIO_OWN)
+		target = obs_source_get_ref(obs_filter_get_parent(ir->source));
+	else if (ir->audio_mode == IR_AUDIO_SOURCE && ir->audio_weak)
+		target = obs_weak_source_get_source(ir->audio_weak);
+	pthread_mutex_unlock(&ir->mutex);
+	return target;
+}
+
 static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint64_t *out_ts,
 				 uint32_t mixers, struct audio_output_data *mixes)
 {
@@ -187,81 +221,80 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 		return true;
 	}
 
-	obs_source_t *parent = obs_filter_get_parent(ir->source);
-	if (!parent || obs_source_removed(parent)) {
-		*out_ts = start_ts_in;
+	obs_source_t *target = resolve_audio_target(ir);
+	if (!target || obs_source_removed(target)) {
+		obs_source_release(target); /* NULL-safe */
+		*out_ts = start_ts_in;       /* emit silence */
 		return true;
 	}
 
-	const uint32_t flags = obs_source_get_output_flags(parent);
+	bool ret = true;
+	const uint32_t flags = obs_source_get_output_flags(target);
 
 	/* Composite sources (scenes/groups): sum the active child tree. */
 	if ((flags & OBS_SOURCE_COMPOSITE) != 0) {
 		uint64_t min_ts = 0;
-		obs_source_enum_active_tree(parent, calc_min_ts, &min_ts);
+		obs_source_enum_active_tree(target, calc_min_ts, &min_ts);
 		if (!min_ts) {
 			*out_ts = start_ts_in;
-			return true;
-		}
-		struct obs_source_audio mixed = {};
-		for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
-			mixed.data[i] = (uint8_t *)mixes->data[i];
-		mixed.timestamp = min_ts;
-		mixed.speakers = (enum speaker_layout)audio_output_get_channels(ir->audio_output);
-		mixed.samples_per_sec = audio_output_get_sample_rate(ir->audio_output);
-		mixed.format = AUDIO_FORMAT_FLOAT_PLANAR;
-		obs_source_enum_active_tree(parent, mix_audio, &mixed);
+		} else {
+			struct obs_source_audio mixed = {};
+			for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
+				mixed.data[i] = (uint8_t *)mixes->data[i];
+			mixed.timestamp = min_ts;
+			mixed.speakers = (enum speaker_layout)audio_output_get_channels(ir->audio_output);
+			mixed.samples_per_sec = audio_output_get_sample_rate(ir->audio_output);
+			mixed.format = AUDIO_FORMAT_FLOAT_PLANAR;
+			obs_source_enum_active_tree(target, mix_audio, &mixed);
 
-		for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
-			if ((mixers & (1 << m)) == 0)
-				continue;
-			for (size_t ch = 0; ch < (size_t)mixed.speakers; ch++) {
-				float *d = mixes[m].data[ch];
-				for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
-					float v = d[i];
-					d[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+			for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
+				if ((mixers & (1 << m)) == 0)
+					continue;
+				for (size_t ch = 0; ch < (size_t)mixed.speakers; ch++) {
+					float *d = mixes[m].data[ch];
+					for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
+						float v = d[i];
+						d[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+					}
 				}
 			}
+			*out_ts = min_ts;
 		}
-		*out_ts = min_ts;
-		return true;
-	}
-
-	if ((flags & OBS_SOURCE_AUDIO) == 0) {
-		*out_ts = start_ts_in;
-		return true;
-	}
-
-	const uint64_t source_ts = obs_source_get_audio_timestamp(parent);
-	if (!source_ts) {
-		*out_ts = start_ts_in;
-		return true;
-	}
-	if (obs_source_audio_pending(parent))
-		return false;
-
-	struct obs_source_audio_mix audio;
-	obs_source_get_audio_mix(parent, &audio);
-	const size_t channels = audio_output_get_channels(ir->audio_output);
-	for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
-		if ((mixers & (1 << m)) == 0)
-			continue;
-		for (size_t ch = 0; ch < channels; ch++) {
-			float *out = mixes[m].data[ch];
-			float *in = audio.output[0].data[ch];
-			if (!in)
-				continue;
-			for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
-				out[i] += in[i];
-				if (out[i] > 1.0f)
-					out[i] = 1.0f;
-				else if (out[i] < -1.0f)
-					out[i] = -1.0f;
+	} else if ((flags & OBS_SOURCE_AUDIO) == 0) {
+		*out_ts = start_ts_in; /* chosen source has no audio: silence */
+	} else {
+		const uint64_t source_ts = obs_source_get_audio_timestamp(target);
+		if (!source_ts) {
+			*out_ts = start_ts_in;
+		} else if (obs_source_audio_pending(target)) {
+			ret = false;
+		} else {
+			struct obs_source_audio_mix audio;
+			obs_source_get_audio_mix(target, &audio);
+			const size_t channels = audio_output_get_channels(ir->audio_output);
+			for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
+				if ((mixers & (1 << m)) == 0)
+					continue;
+				for (size_t ch = 0; ch < channels; ch++) {
+					float *out = mixes[m].data[ch];
+					float *in = audio.output[0].data[ch];
+					if (!in)
+						continue;
+					for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
+						out[i] += in[i];
+						if (out[i] > 1.0f)
+							out[i] = 1.0f;
+						else if (out[i] < -1.0f)
+							out[i] = -1.0f;
+					}
+				}
 			}
+			*out_ts = source_ts;
 		}
 	}
-	*out_ts = source_ts;
-	return true;
+
+	obs_source_release(target);
+	return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -410,7 +443,12 @@ static bool start_recording(struct isolated_record *ir, obs_data_t *settings)
 		return false;
 
 	build_video_encoder(ir, settings);
-	build_audio_encoder(ir, settings);
+
+	pthread_mutex_lock(&ir->mutex);
+	const bool want_audio = (ir->audio_mode != IR_AUDIO_NONE);
+	pthread_mutex_unlock(&ir->mutex);
+	if (want_audio)
+		build_audio_encoder(ir, settings);
 
 	const char *format = obs_data_get_string(settings, "rec_format");
 	if (!format || !*format)
@@ -460,7 +498,9 @@ static bool start_recording(struct isolated_record *ir, obs_data_t *settings)
 	obs_data_release(os);
 
 	obs_output_set_video_encoder(ir->file_output, ir->video_encoder);
-	obs_output_set_audio_encoder(ir->file_output, ir->audio_encoder, 0);
+	/* NONE => video-only file. Pass NULL to clear any stale encoder on a
+	 * reused output that previously recorded with audio. */
+	obs_output_set_audio_encoder(ir->file_output, want_audio ? ir->audio_encoder : NULL, 0);
 
 	/* Feed the parent source into the private view, and force it to render
 	 * even when it isn't visible in the active scene. */
@@ -653,6 +693,15 @@ static obs_properties_t *ir_get_properties(void *data)
 	obs_properties_add_int(props, "scale_width", obs_module_text("Width"), 0, 16384, 2);
 	obs_properties_add_int(props, "scale_height", obs_module_text("Height"), 0, 16384, 2);
 
+	/* Which audio is embedded in this source's file. Default ("") is the
+	 * source's own audio; "__none__" makes a video-only file; or pick another
+	 * audio source to override (e.g. a clean mic feed). */
+	obs_property_t *asrc = obs_properties_add_list(props, "audio_source", obs_module_text("AudioSource"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(asrc, obs_module_text("AudioSource.Own"), "");
+	obs_property_list_add_string(asrc, obs_module_text("AudioSource.None"), IR_AUDIO_NONE_TOKEN);
+	obs_enum_sources(add_audio_source_to_list, asrc);
+
 	obs_property_t *aenc = obs_properties_add_list(props, "audio_encoder", obs_module_text("AudioEncoder"),
 						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	i = 0;
@@ -680,6 +729,8 @@ static void ir_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "video_bitrate", 2500);
 	obs_data_set_default_string(settings, "audio_encoder", "ffmpeg_aac");
 	obs_data_set_default_int(settings, "audio_bitrate", 160);
+	/* Default audio = the source's own audio (empty selects IR_AUDIO_OWN). */
+	obs_data_set_default_string(settings, "audio_source", "");
 
 	/* New sources inherit the global default destination folder. */
 	std::string folder = ir::default_folder();
@@ -697,12 +748,51 @@ static const char *ir_get_name(void *unused)
 	return obs_module_text("IsolatedRecord");
 }
 
+/* Parse the "audio_source" setting into mode + (re)resolved weak ref. Resolves
+ * the named source OUTSIDE ir->mutex (obs_get_source_by_name takes the global
+ * source lock) to avoid any lock-order coupling, then swaps under the lock. */
+static void update_audio_override(struct isolated_record *ir, obs_data_t *settings)
+{
+	const char *sel = obs_data_get_string(settings, "audio_source");
+
+	enum ir_audio_mode mode;
+	char name[256];
+	name[0] = '\0';
+	if (!sel || !*sel) {
+		mode = IR_AUDIO_OWN;
+	} else if (strcmp(sel, IR_AUDIO_NONE_TOKEN) == 0) {
+		mode = IR_AUDIO_NONE;
+	} else {
+		mode = IR_AUDIO_SOURCE;
+		snprintf(name, sizeof(name), "%s", sel);
+	}
+
+	obs_weak_source_t *new_weak = NULL;
+	if (mode == IR_AUDIO_SOURCE) {
+		obs_source_t *s = obs_get_source_by_name(name);
+		if (s) {
+			new_weak = obs_source_get_weak_source(s);
+			obs_source_release(s);
+		}
+	}
+
+	pthread_mutex_lock(&ir->mutex);
+	ir->audio_mode = mode;
+	snprintf(ir->audio_source_name, sizeof(ir->audio_source_name), "%s", name);
+	obs_weak_source_t *old_weak = ir->audio_weak;
+	ir->audio_weak = new_weak;
+	pthread_mutex_unlock(&ir->mutex);
+	obs_weak_source_release(old_weak);
+}
+
 static void ir_update(void *data, obs_data_t *settings)
 {
 	struct isolated_record *ir = (struct isolated_record *)data;
 	pthread_mutex_lock(&ir->mutex);
 	ir->mode = (enum ir_record_mode)obs_data_get_int(settings, "record_mode");
 	pthread_mutex_unlock(&ir->mutex);
+
+	update_audio_override(ir, settings);
 
 	/* If recording and encoder settings are editable (not active), push the
 	 * bitrate/format change through on next start; for simplicity we update
@@ -742,6 +832,8 @@ static void ir_destroy(void *data)
 	if (ir->record_hotkey != OBS_INVALID_HOTKEY_ID)
 		obs_hotkey_unregister(ir->record_hotkey);
 
+	obs_weak_source_release(ir->audio_weak);
+
 	pthread_mutex_destroy(&ir->mutex);
 	bfree(ir);
 }
@@ -757,6 +849,31 @@ static void reconcile(struct isolated_record *ir)
 
 	if (ir->closing)
 		return;
+
+	/* If an override audio source was named but not yet resolved (e.g. it
+	 * loaded after this filter, or was renamed/re-added), try once now. */
+	pthread_mutex_lock(&ir->mutex);
+	const bool need_resolve = ir->audio_mode == IR_AUDIO_SOURCE && !ir->audio_weak && ir->audio_source_name[0];
+	char want_name[256];
+	if (need_resolve)
+		snprintf(want_name, sizeof(want_name), "%s", ir->audio_source_name);
+	pthread_mutex_unlock(&ir->mutex);
+	if (need_resolve) {
+		obs_source_t *s = obs_get_source_by_name(want_name);
+		if (s) {
+			obs_weak_source_t *w = obs_source_get_weak_source(s);
+			obs_source_release(s);
+			pthread_mutex_lock(&ir->mutex);
+			/* Re-check: the user may have changed the selection meanwhile. */
+			if (ir->audio_mode == IR_AUDIO_SOURCE && !ir->audio_weak &&
+			    strcmp(ir->audio_source_name, want_name) == 0)
+				ir->audio_weak = w;
+			else
+				w = NULL; /* discard; another update won the race */
+			pthread_mutex_unlock(&ir->mutex);
+			obs_weak_source_release(w); /* NULL if we kept it */
+		}
+	}
 
 	/* Register the toggle hotkey lazily once we know the parent. */
 	if (ir->record_hotkey == OBS_INVALID_HOTKEY_ID) {

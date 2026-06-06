@@ -31,6 +31,13 @@ enum ir_record_mode {
 	IR_MODE_MANUAL = 1,      /* start/stop via the property buttons or hotkey */
 };
 
+/* Which audio gets embedded in this source's video file. */
+enum ir_audio_mode {
+	IR_AUDIO_OWN = 0,    /* the parent source's own audio (default) */
+	IR_AUDIO_NONE = 1,   /* no audio track at all (video-only file) */
+	IR_AUDIO_SOURCE = 2, /* a specific other audio source (audio_weak) */
+};
+
 struct isolated_record {
 	obs_source_t *source; /* the filter source itself */
 
@@ -51,6 +58,14 @@ struct isolated_record {
 	 * use a mutex for the few cross-thread fields. */
 	pthread_mutex_t mutex;
 	enum ir_record_mode mode;
+
+	/* Audio source override for the embedded track (guarded by mutex; read on
+	 * the audio thread). Default IR_AUDIO_OWN = the parent's own audio. When
+	 * IR_AUDIO_SOURCE, audio_weak points at the chosen source (resolved lazily
+	 * from audio_source_name so it survives source load order / renames). */
+	enum ir_audio_mode audio_mode;
+	obs_weak_source_t *audio_weak;
+	char audio_source_name[256];
 	std::atomic<bool> output_active;
 	std::atomic<bool> want_record;   /* manual-mode request flag */
 	std::atomic<bool> starting;      /* an async start task is in flight */
