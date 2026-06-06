@@ -19,7 +19,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 
 NAME=isolated-record
-VERSION=0.1.3
+VERSION=0.1.4
 ARCH="${ARCH:-arm64}"
 BUNDLE_ID=com.exeldro.${NAME}
 
@@ -45,7 +45,7 @@ cat > "$HERE/src/version.h" <<EOF
 #define PROJECT_VERSION "$VERSION"
 #define PROJECT_VERSION_MAJOR 0
 #define PROJECT_VERSION_MINOR 1
-#define PROJECT_VERSION_PATCH 3
+#define PROJECT_VERSION_PATCH 4
 EOF
 
 cflags=(
