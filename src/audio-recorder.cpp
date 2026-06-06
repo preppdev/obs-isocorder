@@ -110,126 +110,69 @@ void capture_cb(void *param, size_t mix_idx, struct audio_data *data)
 	ar->bytes = ar->data_bytes;
 }
 
-/* ---- SOURCE-mode private mix (sums the target source's own audio) ---- */
+/* ---- SOURCE-mode capture (push model) ----
+ *
+ * The target source's audio is captured via obs_source_add_audio_capture_callback
+ * (ar_audio_capture), buffered in per-channel deques, and drained by priv_audio's
+ * input_callback (source_mix_cb). This replaces reading obs_source_get_audio_mix(),
+ * which only yields audio for sources actively rendered in the main mix — so an
+ * isolated source recorded pure silence. (Composite sources don't fire capture
+ * callbacks; the intended targets are regular inputs like mics.) */
 
-void calc_min_ts(obs_source_t *parent, obs_source_t *child, void *param)
+/* Capture callback: append the source's audio into our deques. Source's audio
+ * thread. */
+void ar_audio_capture(void *param, obs_source_t *source, const struct audio_data *audio_data, bool muted)
 {
-	UNUSED_PARAMETER(parent);
-	uint64_t *min_ts = (uint64_t *)param;
-	if (!child || obs_source_audio_pending(child))
+	UNUSED_PARAMETER(source);
+	struct audio_recorder *ar = (struct audio_recorder *)param;
+	const size_t add = audio_data->frames * sizeof(float);
+	if (!add)
 		return;
-	const uint64_t ts = obs_source_get_audio_timestamp(child);
-	if (ts && (!*min_ts || ts < *min_ts))
-		*min_ts = ts;
-}
 
-void mix_audio(obs_source_t *parent, obs_source_t *child, void *param)
-{
-	UNUSED_PARAMETER(parent);
-	if (!child || obs_source_audio_pending(child))
-		return;
-	const uint64_t ts = obs_source_get_audio_timestamp(child);
-	if (!ts)
-		return;
-	struct obs_source_audio *mixed = (struct obs_source_audio *)param;
-	if (ts < mixed->timestamp)
-		return;
-	const size_t pos = (size_t)ns_to_audio_frames(mixed->samples_per_sec, ts - mixed->timestamp);
-	if (pos >= AUDIO_OUTPUT_FRAMES)
-		return;
-	const size_t count = AUDIO_OUTPUT_FRAMES - pos;
-	struct obs_source_audio_mix ca;
-	obs_source_get_audio_mix(child, &ca);
-	for (size_t ch = 0; ch < (size_t)mixed->speakers; ch++) {
-		float *out = ((float *)mixed->data[ch]) + pos;
-		float *in = ca.output[0].data[ch];
-		if (!in)
-			continue;
-		for (size_t i = 0; i < count; i++)
-			out[i] += in[i];
+	pthread_mutex_lock(&ar->audio_buf_mutex);
+	if (ar->buf_channels && ar->audio_buf[0].size == 0)
+		ar->buf_ts = audio_data->timestamp;
+	const size_t cap = (size_t)(ar->buf_sample_rate / 2) * sizeof(float); /* ~0.5s */
+	for (size_t ch = 0; ch < ar->buf_channels; ch++) {
+		if (cap && ar->audio_buf[ch].size > cap)
+			deque_pop_front(&ar->audio_buf[ch], NULL, ar->audio_buf[ch].size - cap);
+		if (muted || !audio_data->data[ch])
+			deque_push_back_zero(&ar->audio_buf[ch], add);
+		else
+			deque_push_back(&ar->audio_buf[ch], audio_data->data[ch], add);
 	}
+	pthread_mutex_unlock(&ar->audio_buf_mutex);
 }
 
+/* priv_audio pulls from here: drain one frame-block from the deques; silence on
+ * underrun (OBS pre-clears the mix buffers). */
 bool source_mix_cb(void *param, uint64_t start_ts, uint64_t end_ts, uint64_t *out_ts, uint32_t mixers,
 		   struct audio_output_data *mixes)
 {
 	UNUSED_PARAMETER(end_ts);
 	struct audio_recorder *ar = (struct audio_recorder *)param;
-	if (ar->closing || !ar->weak) {
-		*out_ts = start_ts;
-		return true;
-	}
-	obs_source_t *src = obs_weak_source_get_source(ar->weak);
-	if (!src || obs_source_removed(src)) {
-		if (src)
-			obs_source_release(src);
-		*out_ts = start_ts;
-		return true;
-	}
+	const size_t need = (size_t)AUDIO_OUTPUT_FRAMES * sizeof(float);
 
-	const uint32_t flags = obs_source_get_output_flags(src);
-	bool ok = false;
-
-	if ((flags & OBS_SOURCE_COMPOSITE) != 0) {
-		uint64_t min_ts = 0;
-		obs_source_enum_active_tree(src, calc_min_ts, &min_ts);
-		if (min_ts) {
-			struct obs_source_audio mixed = {};
-			for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
-				mixed.data[i] = (uint8_t *)mixes->data[i];
-			mixed.timestamp = min_ts;
-			mixed.speakers = (enum speaker_layout)audio_output_get_channels(ar->priv_audio);
-			mixed.samples_per_sec = audio_output_get_sample_rate(ar->priv_audio);
-			mixed.format = AUDIO_FORMAT_FLOAT_PLANAR;
-			obs_source_enum_active_tree(src, mix_audio, &mixed);
+	pthread_mutex_lock(&ar->audio_buf_mutex);
+	const bool have = ar->buf_channels && ar->audio_buf[0].size >= need;
+	if (have) {
+		for (size_t ch = 0; ch < ar->buf_channels; ch++) {
+			float tmp[AUDIO_OUTPUT_FRAMES];
+			deque_pop_front(&ar->audio_buf[ch], tmp, need);
 			for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
 				if ((mixers & (1 << m)) == 0)
 					continue;
-				for (size_t ch = 0; ch < (size_t)mixed.speakers; ch++) {
-					float *d = mixes[m].data[ch];
-					for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
-						float v = d[i];
-						d[i] = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
-					}
-				}
+				if (mixes[m].data[ch])
+					memcpy(mixes[m].data[ch], tmp, need);
 			}
-			*out_ts = min_ts;
-			ok = true;
 		}
-	} else if ((flags & OBS_SOURCE_AUDIO) != 0) {
-		const uint64_t sts = obs_source_get_audio_timestamp(src);
-		if (obs_source_audio_pending(src)) {
-			obs_source_release(src);
-			return false;
-		}
-		if (sts) {
-			struct obs_source_audio_mix a;
-			obs_source_get_audio_mix(src, &a);
-			const size_t ch_n = audio_output_get_channels(ar->priv_audio);
-			for (size_t m = 0; m < MAX_AUDIO_MIXES; m++) {
-				if ((mixers & (1 << m)) == 0)
-					continue;
-				for (size_t ch = 0; ch < ch_n; ch++) {
-					float *out = mixes[m].data[ch];
-					float *in = a.output[0].data[ch];
-					if (!in)
-						continue;
-					for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
-						out[i] += in[i];
-						if (out[i] > 1.0f)
-							out[i] = 1.0f;
-						else if (out[i] < -1.0f)
-							out[i] = -1.0f;
-					}
-				}
-			}
-			*out_ts = sts;
-			ok = true;
-		}
+		*out_ts = ar->buf_ts;
+		ar->buf_ts += (uint64_t)AUDIO_OUTPUT_FRAMES * 1000000000ULL /
+			      (ar->buf_sample_rate ? ar->buf_sample_rate : 48000);
 	}
+	pthread_mutex_unlock(&ar->audio_buf_mutex);
 
-	obs_source_release(src);
-	if (!ok)
+	if (!have)
 		*out_ts = start_ts;
 	return true;
 }
@@ -246,6 +189,20 @@ void stop_capture(struct audio_recorder *ar)
 		audio_output_close(ar->priv_audio);
 		ar->priv_audio = NULL;
 	}
+	/* After the puller (priv_audio) is closed, drop the push capture callback
+	 * and free the deques — order matters so neither thread touches freed
+	 * buffers. (TRACK mode never set these; the calls are no-ops there.) */
+	if (ar->cb_source) {
+		obs_source_remove_audio_capture_callback(ar->cb_source, ar_audio_capture, ar);
+		obs_source_release(ar->cb_source);
+		ar->cb_source = NULL;
+	}
+	pthread_mutex_lock(&ar->audio_buf_mutex);
+	for (size_t ch = 0; ch < MAX_AUDIO_CHANNELS; ch++)
+		deque_free(&ar->audio_buf[ch]);
+	ar->buf_ts = 0;
+	ar->buf_channels = 0;
+	pthread_mutex_unlock(&ar->audio_buf_mutex);
 	if (ar->wav) {
 		/* Fix up RIFF + data chunk sizes now that we know the length. */
 		uint8_t buf[4];
@@ -282,10 +239,13 @@ bool start(struct audio_recorder *ar)
 		ar->cap_audio = obs_get_audio();
 		ar->mix_idx = ar->global_track - 1;
 	} else {
+		/* Match OBS's layout so the channel count lines up with the capture
+		 * callback's data; the WAV downmix to stereo happens in the connect. */
+		const struct audio_output_info *aoi = audio_output_get_info(obs_get_audio());
 		struct audio_output_info oi = {};
 		oi.name = name;
-		oi.speakers = SPEAKERS_STEREO;
-		oi.samples_per_sec = audio_output_get_sample_rate(obs_get_audio());
+		oi.speakers = aoi ? aoi->speakers : SPEAKERS_STEREO;
+		oi.samples_per_sec = aoi ? aoi->samples_per_sec : 48000;
 		oi.format = AUDIO_FORMAT_FLOAT_PLANAR;
 		oi.input_param = ar;
 		oi.input_callback = source_mix_cb;
@@ -293,6 +253,21 @@ bool start(struct audio_recorder *ar)
 			return false;
 		ar->cap_audio = ar->priv_audio;
 		ar->mix_idx = 0;
+
+		/* Register the push capture callback on the target source. */
+		pthread_mutex_lock(&ar->audio_buf_mutex);
+		ar->buf_channels = audio_output_get_channels(ar->priv_audio);
+		ar->buf_sample_rate = audio_output_get_sample_rate(ar->priv_audio);
+		ar->buf_ts = 0;
+		pthread_mutex_unlock(&ar->audio_buf_mutex);
+
+		obs_source_t *src = ar->weak ? obs_weak_source_get_source(ar->weak) : NULL;
+		if (!src) {
+			stop_capture(ar);
+			return false;
+		}
+		obs_source_add_audio_capture_callback(src, ar_audio_capture, ar);
+		ar->cb_source = src; /* keep the strong ref until stop */
 	}
 	if (!ar->cap_audio) {
 		stop_capture(ar);
@@ -384,6 +359,7 @@ struct audio_recorder *new_recorder()
 {
 	auto *ar = (struct audio_recorder *)bzalloc(sizeof(struct audio_recorder));
 	pthread_mutex_init(&ar->mutex, NULL);
+	pthread_mutex_init(&ar->audio_buf_mutex, NULL);
 	make_id(ar->id, sizeof(ar->id));
 	snprintf(ar->filename_format, sizeof(ar->filename_format), "%%CCYY-%%MM-%%DD %%hh-%%mm-%%ss");
 	default_audio_path(ar->path, sizeof(ar->path));
@@ -444,6 +420,7 @@ void remove(void *handle)
 	stop_capture(ar);
 	if (ar->weak)
 		obs_weak_source_release(ar->weak);
+	pthread_mutex_destroy(&ar->audio_buf_mutex);
 	pthread_mutex_destroy(&ar->mutex);
 	bfree(ar);
 	save();
@@ -495,6 +472,7 @@ void shutdown_all()
 		stop_capture(ar);
 		if (ar->weak)
 			obs_weak_source_release(ar->weak);
+		pthread_mutex_destroy(&ar->audio_buf_mutex);
 		pthread_mutex_destroy(&ar->mutex);
 		bfree(ar);
 	}
@@ -602,6 +580,7 @@ void load()
 		obs_data_t *d = obs_data_array_item(arr, i);
 		auto *ar = (struct audio_recorder *)bzalloc(sizeof(struct audio_recorder));
 		pthread_mutex_init(&ar->mutex, NULL);
+		pthread_mutex_init(&ar->audio_buf_mutex, NULL);
 		snprintf(ar->id, sizeof(ar->id), "%s", obs_data_get_string(d, "id"));
 		ar->global_track = (int)obs_data_get_int(d, "track");
 		snprintf(ar->source_name, sizeof(ar->source_name), "%s", obs_data_get_string(d, "source_name"));

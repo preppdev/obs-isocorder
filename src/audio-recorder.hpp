@@ -19,6 +19,8 @@
 
 #include <obs.h>
 #include <util/threading.h>
+#include <util/deque.h>
+#include <media-io/audio-io.h>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -43,6 +45,19 @@ struct audio_recorder {
 	audio_t *priv_audio; /* private mix for SOURCE mode (NULL in TRACK mode) */
 	audio_t *cap_audio;  /* the audio_t we connected to (priv_audio or global) */
 	int mix_idx;         /* mix index we tapped (0 for source; track-1 for track) */
+
+	/* SOURCE mode: push-based capture of the target source's own audio (TRACK
+	 * mode taps the global mix directly and needs none of this). The capture
+	 * callback fills per-channel deques; priv_audio's input_callback drains
+	 * them. Replaces obs_source_get_audio_mix(), which only yields audio for
+	 * sources actively rendered in the main mix (so isolated sources recorded
+	 * silence). Guarded by audio_buf_mutex. */
+	pthread_mutex_t audio_buf_mutex;
+	struct deque audio_buf[MAX_AUDIO_CHANNELS];
+	size_t buf_channels;
+	uint32_t buf_sample_rate;
+	uint64_t buf_ts;         /* ns timestamp of the oldest buffered sample */
+	obs_source_t *cb_source; /* source the capture cb is on (strong ref) */
 	FILE *wav;           /* open output file */
 	uint32_t channels;
 	uint32_t sample_rate;
